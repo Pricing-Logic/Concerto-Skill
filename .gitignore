@@ -1,0 +1,17 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+.build/
+.worktrees/
+node_modules/
+
+# Temp files from pipeline
+/tmp/concerto-*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
