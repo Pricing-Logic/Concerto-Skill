@@ -1,7 +1,7 @@
 ---
 name: concerto
-version: 1.1.0
-description: Multi-model orchestration skill. Auto-scales model selection, thinking effort, and concurrency based on task complexity. Use when user says "concerto", "orchestrate", "full pipeline", "plan and implement", or wants automated plan → red-team → implement → QA → merge workflow.
+version: 1.2.0
+description: Multi-model orchestration skill. Auto-scales model selection, thinking effort, and concurrency based on task complexity. Use when user says "concerto", "orchestrate", "full pipeline", "plan and implement", or wants automated plan → red-team → implement → QA → merge workflow. Supports --dry-run for cost preview.
 argument-hint: [task description or user request to orchestrate]
 ---
 
@@ -102,6 +102,11 @@ You ARE the planner. Assess the user's request and produce a structured plan:
 1. **Assess complexity**: Is this trivial, bounded, standard, complex, or architectural?
 2. **Decompose**: Break into discrete tasks if complex. Each task gets one worker.
 3. **Route each task**: Assign a worker type from the routing table below.
+4. **Estimate cost**: Count codex exec calls (red-team + workers + QA checks) and show the user.
+
+### Dry-Run Mode
+
+If the user says `/concerto --dry-run <task>` or `"concerto dry run"`, output the full plan (tasks, worker assignments, estimated codex calls, estimated wall time) **without executing**. This lets the user review the pipeline cost before committing. After a dry run, the user can say "go" or "proceed" to execute the plan.
 
 ### Complexity Routing Table
 
@@ -157,14 +162,17 @@ ONLY flag issues that would:
 
 DO NOT flag: style preferences, extra validation, nice-to-haves, additional abstractions.
 
-Output EXACTLY this structure:
+Output EXACTLY this structure (delimiters are mandatory for machine parsing):
 
-**Verdict:** APPROVE | AMEND | BLOCK
-**Findings** (if any):
+<<<CONCERTO_VERDICT>>>
+VERDICT: APPROVE | AMEND | BLOCK
+FINDINGS:
 1. [Finding] — [Fix]
+<<<END_CONCERTO_VERDICT>>>
 
-**Task Packet** (for the implementation worker — include even if APPROVE):
-```
+Then emit one Task Packet per task (delimiters mandatory):
+
+<<<CONCERTO_PACKET task_id="task-1">>>
 SCOPE: [what to build/change — 2-3 sentences]
 FILES_TO_CREATE: [list with purpose]
 FILES_TO_MODIFY: [list with what changes]
@@ -173,7 +181,7 @@ ACCEPTANCE_CRITERIA:
 - [criterion 2]
 KNOWN_RISKS: [risks from red-team, worker should watch for these]
 QA_FOCUS: [specific areas QA should scrutinize]
-```
+<<<END_CONCERTO_PACKET>>>
 
 ---
 
@@ -192,18 +200,28 @@ cat "$REQUEST_FILE" | $TIMEOUT_CMD 300 codex exec \
   --sandbox read-only \
   -C "$(pwd)" \
   -o "$OUTPUT_FILE" \
-  -
+  - > /dev/null 2>&1
 
-echo "=== RED-TEAM RESULT ==="
-cat "$OUTPUT_FILE"
+# ONLY read the -o output file. Do NOT also cat stdout — codex exec
+# duplicates output to stdout and -o, tripling your token count.
 ```
 
-**Handle the result:**
-- **APPROVE**: Extract the Task Packet. Proceed to Step 3.
-- **AMEND**: Update your plan with the fixes, extract the Task Packet. Proceed.
+**Extract structured results** from the output file:
+
+```bash
+# Extract verdict
+VERDICT=$(sed -n '/<<<CONCERTO_VERDICT>>>/,/<<<END_CONCERTO_VERDICT>>>/p' "$OUTPUT_FILE" | grep "^VERDICT:" | head -1)
+
+# Extract task packet(s) — one per task
+sed -n '/<<<CONCERTO_PACKET/,/<<<END_CONCERTO_PACKET>>>/p' "$OUTPUT_FILE" > "$PACKET_FILE"
+```
+
+**Handle the verdict:**
+- **APPROVE**: Extract the Task Packet(s). Proceed to Step 3.
+- **AMEND**: Update your plan with the findings, extract the Task Packet(s). Proceed.
 - **BLOCK**: Show the user what Codex found. Ask if they want to proceed anyway or revise.
 
-**Save the Task Packet(s)** — one packet per task/worktree. For single-task runs, there's one packet. For multi-task runs, each task gets its own packet from one red-team call (ask Codex to emit one packet per task in your plan).
+**Save the Task Packet(s)** — one packet per task/worktree. For single-task runs, there's one packet. For multi-task runs, each task gets its own packet from one red-team call (the delimiters include `task_id` for extraction).
 
 Pass each task's packet to its worker prompt AND its QA prompts. This avoids recomputing scope/criteria in every stage.
 
@@ -234,7 +252,7 @@ Launch multiple independent Agent calls in parallel (max 3 simultaneous) using a
 
 ### For Codex workers:
 
-Create worktree, run codex exec with the **Task Packet from Step 2**, track the branch:
+Create worktree, bootstrap dependencies, run codex exec with the **Task Packet from Step 2**, track the branch:
 
 ```bash
 TASK_ID="task-1"
@@ -242,6 +260,22 @@ BRANCH="concerto/$TASK_ID"
 WORKTREE=".worktrees/$TASK_ID"
 
 git worktree add -b "$BRANCH" "$WORKTREE"
+
+# Worktree bootstrap — install dependencies before dispatching the worker.
+# Worktrees share git objects but NOT node_modules, venv, etc.
+if [ -f "$WORKTREE/package.json" ]; then
+  if [ -f "$WORKTREE/pnpm-lock.yaml" ]; then
+    (cd "$WORKTREE" && pnpm install --frozen-lockfile 2>/dev/null || pnpm install)
+  elif [ -f "$WORKTREE/yarn.lock" ]; then
+    (cd "$WORKTREE" && yarn install --frozen-lockfile 2>/dev/null || yarn install)
+  else
+    (cd "$WORKTREE" && npm ci 2>/dev/null || npm install --legacy-peer-deps)
+  fi
+elif [ -f "$WORKTREE/requirements.txt" ]; then
+  (cd "$WORKTREE" && pip install -r requirements.txt -q)
+elif [ -f "$WORKTREE/Cargo.toml" ]; then
+  (cd "$WORKTREE" && cargo fetch -q 2>/dev/null)
+fi
 
 # NOTE: No --sandbox flag for workers! Workers MUST be able to write files.
 # See "Role-Specific Codex Flags" table above.
@@ -270,7 +304,25 @@ For **codex-mini** workers: use `-m gpt-5.4-mini -c model_reasoning_effort=mediu
 
 ## Step 4: QA Gate (4 parallel Codex checks)
 
-**Run after ALL workers complete** (or per-worktree as each independent worker finishes — see Streaming QA below).
+**Run after ALL workers complete.** For >3 independent workers, you may start QA on completed worktrees while others are still running (streaming QA). For <=3 workers, just wait for all to finish — the complexity isn't worth the wall-clock savings.
+
+### QA Skip for Non-Code Tasks
+
+If a task only touches non-code files (markdown, LICENSE, .gitignore, package.json metadata like author/description, config comments), **skip the full 4-check QA gate**. Instead, run a single quick sanity check:
+
+```bash
+$TIMEOUT_CMD 60 codex exec \
+  -m gpt-5.4-mini \
+  -c model_reasoning_effort=medium \
+  -c service_tier=fast \
+  --enable fast_mode \
+  --ephemeral \
+  --sandbox read-only \
+  -C "$WORKTREE" \
+  - <<< "Quick sanity check: does this diff contain only non-code changes (docs, license, config metadata)? Any accidental code changes? Output: PASS or FAIL with reason."
+```
+
+This saves ~$2-3 and 4 minutes per non-code task.
 
 ### Build the Review Bundle (once per worktree, persist to temp files)
 
@@ -312,34 +364,47 @@ cat "$BUNDLE_DIR/packet.txt" "$BUNDLE_DIR/touched.txt" "$BUNDLE_DIR/diff.txt" | 
 
 ### QA Output Contract
 
-Each QA check MUST output this exact structure:
+Each QA check MUST output this exact structure with delimiters (for machine parsing from noisy codex output):
 
 ```
-VERDICT: PASS | FAIL
-BLOCKERS: [only correctness bugs, security issues, spec mismatches, mergeability problems, harmful abstractions]
-NOTES: [style preferences, naming suggestions, optional refactors — these do NOT affect the verdict]
+<<<CONCERTO_QA>>>
+{"verdict": "PASS", "blockers": [], "notes": ["optional observation"]}
+<<<END_CONCERTO_QA>>>
 ```
 
-**FAIL is ONLY allowed for BLOCKERS.** Style, naming, and optional refactors go in NOTES and do not block the merge. This prevents false-FAIL loops on subjective issues.
+Or on FAIL:
+```
+<<<CONCERTO_QA>>>
+{"verdict": "FAIL", "blockers": ["shell injection via unescaped PTY input"], "notes": ["consider renaming helper"]}
+<<<END_CONCERTO_QA>>>
+```
 
-### The 4 focused prompts (include the output contract in each):
+**FAIL is ONLY allowed for BLOCKERS** (correctness bugs, security issues, spec mismatches, mergeability problems, harmful abstractions). Style, naming, and optional refactors go in `notes` and do not block the merge. This prevents false-FAIL loops on subjective issues.
 
-1. **Bloat check**: "Review this diff for harmful abstractions, dead code, over-engineering that will impede maintenance. Style preferences and naming go in NOTES. Output: VERDICT: PASS|FAIL, BLOCKERS: [...], NOTES: [...]"
+**Extract verdict from output file:**
+```bash
+RESULT=$(sed -n '/<<<CONCERTO_QA>>>/,/<<<END_CONCERTO_QA>>>/p' "$OUTPUT_FILE" | grep -v '<<<')
+VERDICT=$(echo "$RESULT" | grep -o '"verdict": *"[^"]*"' | head -1 | grep -o 'PASS\|FAIL')
+```
 
-2. **Conflict check**: "Review this diff for merge conflicts with main, semantic divergence from the base branch, and integration issues. Check touched files against the base. Output: VERDICT: PASS|FAIL, BLOCKERS: [...], NOTES: [...]"
+### The 4 focused prompts (include the output contract and delimiters in each):
 
-3. **Bug scan**: "Review this diff for null access, off-by-one errors, race conditions, resource leaks, pipe deadlocks, and security issues. Theoretical concerns go in NOTES. Output: VERDICT: PASS|FAIL, BLOCKERS: [...], NOTES: [...]"
+1. **Bloat check**: "Review this diff for harmful abstractions, dead code, over-engineering that will impede maintenance. Style preferences go in notes. Output your result inside <<<CONCERTO_QA>>> delimiters as JSON: {\"verdict\": \"PASS|FAIL\", \"blockers\": [...], \"notes\": [...]}"
 
-4. **Logic verify**: "Compare this diff against the task packet below. Does the implementation meet all acceptance criteria? Are known risks addressed? Output: VERDICT: PASS|FAIL, BLOCKERS: [...], NOTES: [...]"
+2. **Conflict check**: "Review this diff for merge conflicts with main, semantic divergence from the base branch, and integration issues. Check touched files against the base. Output your result inside <<<CONCERTO_QA>>> delimiters as JSON: {\"verdict\": \"PASS|FAIL\", \"blockers\": [...], \"notes\": [...]}"
+
+3. **Bug scan**: "Review this diff for null access, off-by-one errors, race conditions, resource leaks, pipe deadlocks, and security issues (especially shell injection, XSS). Theoretical concerns go in notes. Output your result inside <<<CONCERTO_QA>>> delimiters as JSON: {\"verdict\": \"PASS|FAIL\", \"blockers\": [...], \"notes\": [...]}"
+
+4. **Logic verify**: "Compare this diff against the task packet below. Does the implementation meet all acceptance criteria? Are known risks addressed? Output your result inside <<<CONCERTO_QA>>> delimiters as JSON: {\"verdict\": \"PASS|FAIL\", \"blockers\": [...], \"notes\": [...]}"
 
 ### Gate rule:
 - All 4 PASS → proceed to merge
-- Any FAIL → fix ONLY the BLOCKERS (ignore NOTES), then re-run ONLY the failing checks (carry forward PASS results)
+- Any FAIL → fix ONLY the BLOCKERS (ignore notes), then re-run ONLY the failing checks (carry forward PASS results)
 - Max 2 remediation cycles. After that, report remaining BLOCKERS to user and ask for guidance.
 
-### Streaming QA (multi-worker runs)
+### Stale PASS rule (multi-worker merges)
 
-For tasks with multiple independent workers: start QA for a completed worktree immediately, don't wait for all workers to finish. This overlaps QA with remaining worker execution and saves wall-clock time.
+After each merge changes the base branch, any previously-passed **conflict check** and **logic verify** results for remaining branches are stale. Re-run those two checks (rebased against new base) before merging the next branch. **Bloat** and **bug scan** PASS results carry forward (they don't depend on base branch state).
 
 **Stale PASS rule**: After each merge changes main, any previously-passed **conflict check** and **logic verify** results for remaining branches are stale. Re-run those two checks (rebased against new main) before merging the next branch. **Bloat** and **bug scan** PASS results carry forward (they don't depend on main state).
 
@@ -357,9 +422,18 @@ WORKTREE="<actual worktree path>"
 # Merge with full abort-on-any-failure
 git merge --no-ff --no-commit "$BRANCH" || { git merge --abort; echo "MERGE BLOCKED: conflict"; exit 1; }
 
+# Build/type check if framework detected
+if [ -f tsconfig.json ]; then
+  npx tsc --noEmit || { git merge --abort; echo "MERGE BLOCKED: TypeScript errors"; exit 1; }
+fi
+
 # Run tests if framework detected
 if [ -f package.json ] && grep -q '"test"' package.json; then
   npm test || { git merge --abort; echo "MERGE BLOCKED: tests failed"; exit 1; }
+elif [ -f Cargo.toml ]; then
+  cargo test || { git merge --abort; echo "MERGE BLOCKED: tests failed"; exit 1; }
+elif [ -f pytest.ini ] || [ -f pyproject.toml ]; then
+  python -m pytest --tb=short || { git merge --abort; echo "MERGE BLOCKED: tests failed"; exit 1; }
 fi
 
 # Commit — abort if commit fails (hook, signing, identity)
@@ -371,6 +445,13 @@ git branch -d "$BRANCH" 2>/dev/null
 ```
 
 **On ANY failure**: `git merge --abort` immediately. Never manually delete `.git/MERGE_HEAD`. Report the failure and ask the user how to proceed.
+
+### Post-Merge Stash Reconciliation
+
+If you stashed changes at preflight, be careful with `git stash pop` after the pipeline:
+- The stash may conflict with changes the pipeline just merged (especially `package.json`, lock files, config).
+- The stash may contain changes that were **intentionally omitted** from the pipeline — the user may want to selectively restore, not blindly pop.
+- **Do NOT auto-pop the stash.** Instead, tell the user: "Your pre-pipeline changes are in `git stash`. Some may conflict with the merged changes. Run `git stash show` to review, then `git stash pop` or `git stash drop` as appropriate."
 
 ## Step 6: Cleanup Sweep (always runs)
 

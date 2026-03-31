@@ -69,10 +69,20 @@ The skill activates when you say any of:
 
 /concerto add pagination to the /users endpoint and update the tests
 
-concerto: migrate the database layer from Prisma to Drizzle
+/concerto --dry-run migrate the database layer from Prisma to Drizzle
 
 plan and implement a rate limiter for the API with Redis backing
 ```
+
+### Dry-Run Mode
+
+Use `--dry-run` to preview the plan (tasks, workers, estimated codex calls, wall time) without executing:
+
+```
+/concerto --dry-run add SSO login with SAML support
+```
+
+Review the plan, then say "go" or "proceed" to execute.
 
 ### What happens behind the scenes
 
@@ -147,13 +157,15 @@ If you are a coding agent (Claude, Codex, etc.) and want to understand this skil
 
 3. **Worker isolation** uses git worktrees. Claude models use `Agent(isolation: "worktree")`. Codex models use `git worktree add` + `codex exec -C <worktree>`.
 
-4. **The Task Packet** (produced in Step 2 by the red-team) is the central data structure — it flows from red-team to worker prompt to QA prompt. This avoids recomputing scope/criteria at each stage.
+4. **The Task Packet** (produced in Step 2 by the red-team) is the central data structure — it flows from red-team to worker prompt to QA prompt. This avoids recomputing scope/criteria at each stage. Task Packets are wrapped in `<<<CONCERTO_PACKET>>>` delimiters for machine extraction.
 
-5. **QA uses a strict output contract**: `VERDICT: PASS|FAIL`, `BLOCKERS: [...]`, `NOTES: [...]`. Only BLOCKERS can cause a FAIL. Style/naming preferences go in NOTES and never block a merge.
+5. **All structured outputs use delimiters** for reliable parsing from noisy codex output. Red-team verdicts use `<<<CONCERTO_VERDICT>>>`, QA results use `<<<CONCERTO_QA>>>` with JSON payloads. Extract with `sed -n '/<<<CONCERTO_QA>>>/,/<<<END_CONCERTO_QA>>>/p'`. Only BLOCKERS can cause a FAIL — style/naming go in `notes` and never block.
 
-6. **Timeouts are enforced at the bash level** via `gtimeout` (macOS) or `timeout` (Linux), not via Codex agent config. Every `codex exec` call is wrapped with `$TIMEOUT_CMD <seconds>`.
+6. **Worktree bootstrap**: For Node.js/Python/Rust projects, the skill installs dependencies in each worktree before dispatching the worker. Non-code tasks (docs, license, config metadata) skip the full 4-check QA gate.
 
-7. **Cleanup always runs** — even on failure. It removes all non-main worktrees and `concerto/*` branches.
+7. **Timeouts are enforced at the bash level** via `gtimeout` (macOS) or `timeout` (Linux), not via Codex agent config. Every `codex exec` call is wrapped with `$TIMEOUT_CMD <seconds>`.
+
+8. **Cleanup always runs** — even on failure. It removes all non-main worktrees and `concerto/*` branches.
 
 ## Customization
 
